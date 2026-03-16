@@ -36,15 +36,28 @@ def init_globals(device="cuda:0"):
     barriers = torch.zeros((1, 10, 1024), device=device, dtype=torch.int32)
     
     # Create Globals instance (mocking other fields)
+    # We must provide dummy tensors for ALL fields that the C++ MK interpreter expects,
+    # otherwise einops or PyBind11 will throw errors when trying to unpack None.
+    
+    # Dummy tensors for things we don't care about in this MoE test
+    dummy_weight = torch.zeros(1, device=device, dtype=torch.bfloat16)
+    dummy_k_cache = torch.zeros(1, 1, 1, 1, 1, device=device, dtype=torch.bfloat16)
+    dummy_v_cache = torch.zeros(1, 1, 1, 1, 1, device=device, dtype=torch.bfloat16)
+    dummy_rope = torch.zeros(1, device=device, dtype=torch.float32)
+    dummy_attn_out = torch.zeros(1, device=device, dtype=torch.bfloat16)
+    dummy_lse = torch.zeros(1, device=device, dtype=torch.float32)
+    dummy_int = torch.zeros(1, device=device, dtype=torch.int32)
+    
     globs = Globals(
-        qkv_proj_weights=None, o_proj_weights=None, attn_ln_weights=None, mlp_ln_weights=None,
-        up_proj_weights=None, gate_proj_weights=None, down_proj_weights=None,
-        lm_head_norm_weights=None, lm_head_weights=None, k_cache=None, v_cache=None,
-        rope_cos=None, rope_sin=None,
+        qkv_proj_weights=dummy_weight, o_proj_weights=dummy_weight, attn_ln_weights=dummy_weight, mlp_ln_weights=dummy_weight,
+        up_proj_weights=dummy_weight, gate_proj_weights=dummy_weight, down_proj_weights=dummy_weight,
+        lm_head_norm_weights=dummy_weight, lm_head_weights=dummy_weight, 
+        k_cache=dummy_k_cache, v_cache=dummy_v_cache,
+        rope_cos=dummy_rope, rope_sin=dummy_rope,
         
         hidden_states=hidden_states,
-        post_ln_rope_q=None, attn_out=None, attn_lse_intermediates=None, attn_out_intermediates=None,
-        silu_out=None, logits=None,
+        post_ln_rope_q=dummy_weight, attn_out=dummy_attn_out, attn_lse_intermediates=dummy_lse, attn_out_intermediates=dummy_attn_out,
+        silu_out=dummy_weight, logits=dummy_weight,
         
         moe_up_proj_weights=moe_up,
         moe_gate_proj_weights=moe_gate,
