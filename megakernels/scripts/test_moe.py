@@ -149,8 +149,7 @@ def test_moe_correctness():
 
     # Construct instructions tensor
     print("Tensorizing instructions for MK...")
-    from megakernels.demos.latency.scheduler import assign_dag_to_sms, tensorize_instructions
-    from megakernels.demos.latency.python_vm import DAG_Node
+    from megakernels.demos.latency.scheduler import tensorize_instructions
     
     # We need to construct a DAG to use the scheduler, but for a simple test we can just serialize them manually.
     # However, to test the scheduler's interleaving logic, it's better to use the DAG.
