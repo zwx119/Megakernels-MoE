@@ -191,24 +191,7 @@ def test_moe_correctness():
     
     print("Executing Megakernel...")
     try:
-        # Some versions of Megakernels use .run() or just pass globals to the bound function
-        # Let's check how mk is usually invoked. In mk.py:
-        # self.mk = getattr(self.module, "mk_llama")
-        # self.mk(globals.Bar, globals.instructions, ...)
-        # The interpreter class handles unpacking Globals.
-        # Wait, LatencyMK_Interpreter has a method `__call__` in some versions, or `run`?
-        # Actually, in generators.py they do `self.interpreter(self.globs)`!
-        # If 'LatencyMK_Interpreter' object is not callable, let's look at dispatch.py or mk.py.
-        # In megakernels/demos/latency/mk.py, the class is LatencyMK_Interpreter.
-        # It has a `__call__` method. If it's not callable, maybe we need to instantiate it first?
-        # make_mk_interpreter returns the CLASS? Or the instance?
-        # In generators.py:
-        # Interpreter = make_mk_interpreter(config.mode, ...)
-        # self.interpreter = Interpreter(config.ntok, config.num_iters, config.num_warmup)
-        # Ah! make_mk_interpreter returns a CLASS! We need to instantiate it!
-        
-        interpreter_instance = interpreter(ntok=1, num_iters=1, num_warmup=0)
-        interpreter_instance(globs)
+        interpreter.interpret(globs)
         print("MK execution completed.")
     except Exception as e:
         print(f"Error during MK execution: {e}")
