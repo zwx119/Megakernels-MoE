@@ -222,12 +222,15 @@ template <typename Config, typename Globals> struct moe_expert_op {
 
     struct loader {
         static __device__ void run(const Globals &g, megakernel::state<Config> &s) {
-            pipeline::loader_loop(s, g);
+            parsed_instruction inst{s};
+            pipeline::loader_loop(s, g, inst.layer_idx);
         }
     };
 
     struct launcher {
-        static __device__ void run(const Globals &g, megakernel::state<Config> &s) {}
+        static __device__ void run(const Globals &g, megakernel::state<Config> &s) {
+            pipeline::launcher_loop(s, g);
+        }
     };
 
     struct consumer {
@@ -269,13 +272,13 @@ template <typename Config, typename Globals> struct moe_expert_op {
             // Tell loader we are ready (decrement activation semaphore)
             s.warp_finish_page(pipeline::get_activation_page(s), 1);
 
-            pipeline::consumer_loop(s, g, activations_vec);
+            pipeline::consumer_loop(s, g);
         }
     };
 
     struct storer {
         static __device__ void run(const Globals &g, megakernel::state<Config> &s) {
-            pipeline::storer_loop(s, g);
+            pipeline::storer_loop<1>(s, g);
         }
     };
 };
