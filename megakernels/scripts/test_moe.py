@@ -191,7 +191,8 @@ def test_moe_correctness():
     
     print("Executing Megakernel...")
     try:
-        interpreter(globs)
+        # LatencyMK_Interpreter has a method interpret() instead of being callable directly
+        interpreter.interpret(globs)
         print("MK execution completed.")
     except Exception as e:
         print(f"Error during MK execution: {e}")
