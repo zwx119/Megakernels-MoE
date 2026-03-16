@@ -28,6 +28,20 @@ class Globals(BaseGlobals):
     attn_kv_block_size: int
     attn_reduction_size: int
 
+    # ===== MoE Fields =====
+    moe_up_proj_weights: Optional[Tensor] = None
+    moe_gate_proj_weights: Optional[Tensor] = None
+    moe_down_proj_weights: Optional[Tensor] = None
+    
+    moe_expert_indices: Optional[Tensor] = None
+    moe_expert_weights: Optional[Tensor] = None
+    
+    moe_intermediate: Optional[Tensor] = None
+    
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    moe_block_size: int = 16
+
 
 @dataclass
 class LayerNorm_QKV_MatVecRopeAppend(Instruction):
@@ -194,3 +208,36 @@ class RMS_LM_Head(Instruction):
             * globs.lm_head_block_size
             * globs.hidden_size
         )
+
+
+@dataclass
+class MoEExpertMatVec(Instruction):
+    """
+    MoE Expert MatVec instruction
+    Executes: output[start:end] += expert_weight[start:end, :] @ input_activation
+    """
+    layer_idx: int
+    expert_idx: int         
+    weight_type: int        # 0 = up_proj, 1 = gate_proj, 2 = down_proj
+    start_block_idx: int    
+    end_block_idx: int      
+    reduction_block_idx: int
+
+    @classmethod
+    def opcode(cls) -> int:
+        return 8
+
+    @classmethod
+    def prev_opcode(cls) -> int:
+        return AttentionReduction.opcode()
+
+    @classmethod
+    def tags(cls) -> dict:
+        return {"pool": "compute"}
+
+    def cost(self, globs: Globals):
+        num_blocks = self.end_block_idx - self.start_block_idx
+        if self.weight_type in (0, 1):
+            return num_blocks * globs.moe_block_size * globs.hidden_size
+        else:
+            return num_blocks * globs.moe_block_size * globs.intermediate_size

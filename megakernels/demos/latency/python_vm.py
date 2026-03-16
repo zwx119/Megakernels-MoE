@@ -11,6 +11,7 @@ from megakernels.demos.latency.instructions import (
     Globals,
     LayerNorm_QKV_MatVecRopeAppend,
     LayerNormDoubleMatVecSiLU,
+    MoEExpertMatVec,
     O_ProjResidual,
     PartialAttention,
     RMS_LM_Head,
@@ -229,21 +230,20 @@ def layer_norm_matvec_rope_append(
             )
             out = full_head_with_rope[:, full_head_start:full_head_end].view(-1)
 
-        match mode:
-            case "q":
-                globals.post_ln_rope_q[start:end] = out
-            case "k":
-                start_in_k = start - k_start
-                end_in_k = end - k_start
-                globals.k_cache[layer_idx, :, pos_id].view(-1)[start_in_k:end_in_k] = (
-                    out
-                )
-            case "v":
-                start_in_v = start - v_start
-                end_in_v = end - v_start
-                globals.v_cache[layer_idx, :, pos_id].view(-1)[start_in_v:end_in_v] = (
-                    out
-                )
+        if mode == "q":
+            globals.post_ln_rope_q[start:end] = out
+        elif mode == "k":
+            start_in_k = start - k_start
+            end_in_k = end - k_start
+            globals.k_cache[layer_idx, :, pos_id].view(-1)[start_in_k:end_in_k] = (
+                out
+            )
+        elif mode == "v":
+            start_in_v = start - v_start
+            end_in_v = end - v_start
+            globals.v_cache[layer_idx, :, pos_id].view(-1)[start_in_v:end_in_v] = (
+                out
+            )
 
         barriers[block_idx // 4] += 1
 
@@ -389,8 +389,66 @@ def attention_reduction(globals: Globals, instruction: AttentionReduction):
         ] = reduced
 
     # Barrier update
-    next_op_barriers = globals.barriers[instruction.layer_idx, instruction.opcode() - 1]
     next_op_barriers[0] += globals.attn_reduction_size  # the dumb way
+
+
+def moe_expert_matvec(globals: Globals, instruction: MoEExpertMatVec):
+    layer_idx = instruction.layer_idx
+    expert_idx = instruction.expert_idx
+    
+    # Get actual expert id from routing indices
+    actual_expert_id = globals.moe_expert_indices[layer_idx, 0, 0, expert_idx].item()
+    routing_weight = globals.moe_expert_weights[layer_idx, 0, 0, expert_idx].item()
+    
+    if instruction.weight_type == 0:  # up_proj
+        weight = globals.moe_up_proj_weights[layer_idx, actual_expert_id]
+        input_vec = globals.hidden_states
+        
+        for block_idx in range(instruction.start_block_idx, instruction.end_block_idx):
+            matvec_out, start, end = matvec(
+                mat=weight,
+                vec=input_vec,
+                block_size=globals.moe_block_size,
+                block_idx=block_idx,
+            )
+            globals.moe_intermediate[start:end] = matvec_out.to(globals.moe_intermediate.dtype)
+            
+    elif instruction.weight_type == 1:  # gate_proj
+        weight = globals.moe_gate_proj_weights[layer_idx, actual_expert_id]
+        input_vec = globals.hidden_states
+        
+        for block_idx in range(instruction.start_block_idx, instruction.end_block_idx):
+            gate_out, start, end = matvec(
+                mat=weight,
+                vec=input_vec,
+                block_size=globals.moe_block_size,
+                block_idx=block_idx,
+            )
+            
+            # SiLU(gate) * up
+            up_out = globals.moe_intermediate[start:end].float()
+            globals.moe_intermediate[start:end] = (
+                F.silu(gate_out.float()) * up_out
+            ).to(globals.moe_intermediate.dtype)
+            
+    elif instruction.weight_type == 2:  # down_proj
+        weight = globals.moe_down_proj_weights[layer_idx, actual_expert_id]
+        
+        for block_idx in range(instruction.start_block_idx, instruction.end_block_idx):
+            matvec_out, start, end = matvec(
+                mat=weight,
+                vec=globals.moe_intermediate,
+                block_size=globals.moe_block_size,
+                block_idx=block_idx,
+                reduce=True,
+                reduction_size=globals.intermediate_size // globals.hidden_size * globals.moe_block_size,
+                reduction_idx=instruction.reduction_block_idx,
+            )
+            
+            # 乘以路由权重，并累加到 hidden_states
+            # 注意：实际中可能需要确保 routing_weight 已经在上层或者专门的 reduction 中处理好
+            weighted_out = matvec_out.float() * routing_weight
+            globals.hidden_states[start:end] += weighted_out.to(globals.hidden_states.dtype)
 
 
 INSTRUCTION_TO_SOLVER = {
@@ -401,4 +459,5 @@ INSTRUCTION_TO_SOLVER = {
     RMS_LM_Head: rms_lm_head,
     PartialAttention: partial_attention,
     AttentionReduction: attention_reduction,
+    MoEExpertMatVec: moe_expert_matvec,
 }

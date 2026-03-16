@@ -6,6 +6,7 @@
 #include "matvec_adds.cu"
 #include "upgate.cu"
 #include "rms_lm_head.cu"
+#include "moe_expert.cu"
 
 #include "pyutils/pyutils.cuh"
 
@@ -22,13 +23,14 @@ using o_proj_op = o_proj<default_config, llama_1b_globals>;
 using rms_upgate_silu_op = rms_upgate_silu<default_config, llama_1b_globals>;
 using downproj_op = downproj<default_config, llama_1b_globals>;
 using rms_lm_head_op = rms_lm_head<default_config, llama_1b_globals>;
+using moe_expert_op_t = moe_expert_op<default_config, llama_1b_globals>;
 
 PYBIND11_MODULE(mk_llama, m) {
     m.doc() = "";
     kittens::py::bind_kernel<
         mk<default_config, llama_1b_globals, attention_partial_op,
             attention_reduction_op, rms_qkv_rope_append_op, downproj_op,
-            o_proj_op, rms_upgate_silu_op, rms_lm_head_op>>(
+            o_proj_op, rms_upgate_silu_op, rms_lm_head_op, moe_expert_op_t>>(
         m, "mk_llama", &llama_1b_globals::Bar, &llama_1b_globals::instructions,
         &llama_1b_globals::timings,
 
@@ -46,6 +48,10 @@ PYBIND11_MODULE(mk_llama, m) {
         &llama_1b_globals::attn_out, &llama_1b_globals::attn_lse_intermediates,
         &llama_1b_globals::attn_out_intermediates, &llama_1b_globals::silu_out,
         &llama_1b_globals::logits,
+
+        &llama_1b_globals::moe_up_weights, &llama_1b_globals::moe_gate_weights,
+        &llama_1b_globals::moe_down_weights, &llama_1b_globals::moe_expert_indices,
+        &llama_1b_globals::moe_expert_routing_weights, &llama_1b_globals::moe_intermediate,
 
         &llama_1b_globals::pos_id, &llama_1b_globals::attn_scale,
         &llama_1b_globals::rms_norm_eps,

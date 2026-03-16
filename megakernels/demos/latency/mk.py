@@ -40,6 +40,13 @@ def interpret_with_mk(
         globs.attn_out_intermediates,
         globs.silu_out,
         globs.logits,
+        # moe
+        globs.moe_up_proj_weights,
+        globs.moe_gate_proj_weights,
+        globs.moe_down_proj_weights,
+        globs.moe_expert_indices,
+        globs.moe_expert_weights,
+        globs.moe_intermediate,
         # scalars
         globs.pos_id,
         globs.attn_scale,

@@ -11,6 +11,7 @@
 #define OPCODE_RMS_DoubleMatVecSiLU 5
 #define OPCODE_DownProjResidual 6
 #define OPCODE_RMS_LM_Head 7
+#define OPCODE_MoEExpertMatVec 8
 
 #define LLAMA_1B_NUM_LAYERS 16
 #define LLAMA_1B_HIDDEN_DIM 2048
@@ -47,7 +48,8 @@ using config = megakernel::default_config;
 
 template <int _num_layers, int _hidden_dim, int _intermediate_dim,
           int _head_dim, int _num_attention_heads, int _num_kv_heads,
-          int _kv_block_size, int _matvec_block_size, int _sm_count>
+          int _kv_block_size, int _matvec_block_size, int _sm_count,
+          int _num_experts = 8, int _num_experts_per_tok = 2>
 struct globals_t {
 
     // constexpr static unsigned int num_layers = _num_layers;
@@ -69,6 +71,8 @@ struct globals_t {
     constexpr static int num_attention_heads = _num_attention_heads;
     constexpr static int num_kv_heads = _num_kv_heads;
     constexpr static int sm_count = _sm_count;
+    constexpr static int num_experts = _num_experts;
+    constexpr static int num_experts_per_tok = _num_experts_per_tok;
 
     using instruction_layout =
         megakernel::instruction_layout<config>;
@@ -127,7 +131,7 @@ struct globals_t {
     rope_table_t rope_cos;
     rope_table_t rope_sin;
 
-    // activation buffers
+    // kb buffers
     activations_t hidden_states;
     activations_t q_post_rope;
     activations_t attn_out;
@@ -135,6 +139,25 @@ struct globals_t {
     attn_out_intermediates_t attn_out_intermediates;
     activations_big_indim_t silu_out;
     logits_t logits;
+
+    // moe weights
+    using moe_weights_t =
+        kittens::gl<kittens::bf16, -1, -1, -1, hidden_dim,
+           kittens::st_bf<matvec_block_size, 512>>;
+    using moe_weights_big_t =
+        kittens::gl<kittens::bf16, -1, -1, -1, intermediate_dim,
+           kittens::st_bf<matvec_block_size, 512>>;
+
+    moe_weights_t moe_up_weights;
+    moe_weights_t moe_gate_weights;
+    moe_weights_big_t moe_down_weights;
+
+    using routing_t = kittens::gl<int, 1, 1, -1, num_experts_per_tok>;
+    using routing_weight_t = kittens::gl<float, 1, 1, -1, num_experts_per_tok>;
+    routing_t moe_expert_indices;
+    routing_weight_t moe_expert_routing_weights;
+
+    activations_big_indim_t moe_intermediate;
 
     unsigned int pos_id;
     float attn_scale;
@@ -174,3 +197,6 @@ struct o_proj;
 
 template <typename config = config, typename globals = llama_1b_globals>
 struct rms_upgate_silu;
+
+template <typename config = config, typename globals = llama_1b_globals>
+struct moe_expert_op;

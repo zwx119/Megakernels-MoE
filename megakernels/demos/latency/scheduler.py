@@ -8,6 +8,7 @@ from megakernels.demos.latency.instructions import (
     Instruction,
     LayerNorm_QKV_MatVecRopeAppend,
     LayerNormDoubleMatVecSiLU,
+    MoEExpertMatVec,
     O_ProjResidual,
     PartialAttention,
     RMS_LM_Head,
@@ -89,6 +90,16 @@ def make_globals(
         ),
         silu_out=make_buffer(config.intermediate_size),
         logits=make_buffer(config.vocab_size),
+        # moe fields
+        moe_up_proj_weights=None,
+        moe_gate_proj_weights=None,
+        moe_down_proj_weights=None,
+        moe_expert_indices=None,
+        moe_expert_weights=None,
+        moe_intermediate=make_buffer(config.intermediate_size),
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_block_size=16,
         # scalars
         pos_id=0,
         attn_scale=1 / math.sqrt(config.head_dim),
@@ -139,6 +150,98 @@ def schedule_qkv(
             )
         )
 
+    return instructions
+
+
+def schedule_moe_expert_upgate(
+    globs: Globals,
+    layer_idx: int,
+    expert_idx: int,
+) -> list[MoEExpertMatVec]:
+    instructions = []
+    
+    num_blocks = assert_div(
+        globs.intermediate_size, globs.moe_block_size
+    )
+    sm_count = globs.sm_count()
+    
+    blocks_per_sm = num_blocks / sm_count
+    
+    for sm_idx in range(sm_count):
+        start = round(sm_idx * blocks_per_sm)
+        end = round((sm_idx + 1) * blocks_per_sm)
+        
+        # up_proj
+        instructions.append(
+            MoEExpertMatVec(
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                weight_type=0,  # up_proj
+                start_block_idx=start,
+                end_block_idx=end,
+                reduction_block_idx=0,
+            )
+        )
+        
+        # gate_proj
+        instructions.append(
+            MoEExpertMatVec(
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                weight_type=1,  # gate_proj
+                start_block_idx=start,
+                end_block_idx=end,
+                reduction_block_idx=0,
+            )
+        )
+    
+    return instructions
+
+
+def schedule_moe_expert_downproj(
+    globs: Globals,
+    layer_idx: int,
+    expert_idx: int,
+) -> list[MoEExpertMatVec]:
+    instructions = []
+    
+    num_blocks = assert_div(globs.hidden_size, globs.moe_block_size)
+    num_col_splits = globs.intermediate_size // globs.hidden_size
+    sm_count = globs.sm_count()
+    
+    jobs = [
+        (col_idx, block_idx)
+        for col_idx in range(num_col_splits)
+        for block_idx in range(num_blocks)
+    ]
+    
+    num_assigned = 0
+    for sm_idx in range(sm_count):
+        jobs_left = len(jobs) - num_assigned
+        sms_left = sm_count - sm_idx
+        n = round(jobs_left / sms_left)
+        
+        chunk = jobs[num_assigned : num_assigned + n]
+        if not chunk:
+            continue
+        col_idx = chunk[0][0]
+        same_col = [j for j in chunk if j[0] == col_idx]
+        
+        if same_col:
+            start_blk = same_col[0][1]
+            instructions.append(
+                MoEExpertMatVec(
+                    layer_idx=layer_idx,
+                    expert_idx=expert_idx,
+                    weight_type=2,  # down_proj
+                    start_block_idx=start_blk,
+                    end_block_idx=start_blk + len(same_col),
+                    reduction_block_idx=col_idx,
+                )
+            )
+        
+        num_assigned += len(same_col)
+    
     return instructions
 
 
@@ -358,32 +461,56 @@ def make_dag_layer(
     if stop_after_op == "oproj":
         return new_nodes, o_proj_nodes
 
-    # upgate
-    upgate_instructions = schedule_upgate(globs, layer_idx)
-    upgate_nodes: list[DAG_Node] = []
-    for ins in upgate_instructions:
-        upgate_nodes.append(DAG_Node(ins, o_proj_nodes))
+    # upgate & downproj (dense vs moe)
+    if globs.moe_up_proj_weights is not None:
+        all_moe_downproj_nodes = []
+        for topk_idx in range(globs.num_experts_per_tok):
+            # upgate
+            upgate_instructions = schedule_moe_expert_upgate(
+                globs, layer_idx, expert_idx=topk_idx
+            )
+            upgate_nodes = [DAG_Node(ins, o_proj_nodes) for ins in upgate_instructions]
+            new_nodes.extend(upgate_nodes)
 
-    new_nodes.extend(upgate_nodes)
+            # downproj
+            downproj_instructions = schedule_moe_expert_downproj(
+                globs, layer_idx, expert_idx=topk_idx
+            )
+            downproj_nodes = [DAG_Node(ins, upgate_nodes) for ins in downproj_instructions]
+            new_nodes.extend(downproj_nodes)
+            all_moe_downproj_nodes.extend(downproj_nodes)
 
-    if stop_after_op == "upgate":
-        return new_nodes, upgate_nodes
+        if stop_after_op == "downproj" or stop_after_op == "upgate":
+            return new_nodes, all_moe_downproj_nodes
 
-    # downproj
-    # TODO we can do better - we can start a reduction col's work once that fraction of the upgate work is done
-    downproj_instructions = schedule_downproj(globs, layer_idx)
-    downproj_nodes: list[DAG_Node] = []
-    for ins in downproj_instructions:
-        downproj_nodes.append(DAG_Node(ins, upgate_nodes))
+        assert stop_after_op is None
+        return new_nodes, all_moe_downproj_nodes
+    else:
+        # upgate
+        upgate_instructions = schedule_upgate(globs, layer_idx)
+        upgate_nodes: list[DAG_Node] = []
+        for ins in upgate_instructions:
+            upgate_nodes.append(DAG_Node(ins, o_proj_nodes))
 
-    new_nodes.extend(downproj_nodes)
+        new_nodes.extend(upgate_nodes)
 
-    if stop_after_op == "downproj":
+        if stop_after_op == "upgate":
+            return new_nodes, upgate_nodes
+
+        # downproj
+        downproj_instructions = schedule_downproj(globs, layer_idx)
+        downproj_nodes: list[DAG_Node] = []
+        for ins in downproj_instructions:
+            downproj_nodes.append(DAG_Node(ins, upgate_nodes))
+
+        new_nodes.extend(downproj_nodes)
+
+        if stop_after_op == "downproj":
+            return new_nodes, downproj_nodes
+
+        assert stop_after_op is None
+
         return new_nodes, downproj_nodes
-
-    assert stop_after_op is None
-
-    return new_nodes, downproj_nodes
 
 
 class LatencyScheduleBuilder(ScheduleBuilder):
