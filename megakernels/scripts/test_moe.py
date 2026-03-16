@@ -55,11 +55,68 @@ def init_globals(device="cuda:0"):
     dummy_down = torch.zeros(1, 2048, 8192, device=device, dtype=torch.bfloat16)
     dummy_norm = torch.zeros(1, 2048, device=device, dtype=torch.bfloat16)
     
-    dummy_k_cache = torch.zeros(1, 1, 1, 8, 64, device=device, dtype=torch.bfloat16)
-    dummy_v_cache = torch.zeros(1, 1, 1, 8, 64, device=device, dtype=torch.bfloat16)
     dummy_rope = torch.zeros(1024, 32, device=device, dtype=torch.float32) # [seq_len, head_dim/2]
-    dummy_attn_out = torch.zeros(32, 64, device=device, dtype=torch.bfloat16)
-    dummy_lse = torch.zeros(32, device=device, dtype=torch.float32)
+    # The error "Column dimension mismatch. Expected: 48, Got: 1024" comes from q_post_rope which expects:
+    # shape [num_attention_heads + num_kv_heads, head_dim] -> [32+8, 64] -> [40, 64] ?
+    # Wait, 48 could be num_kv_heads * something?
+    # Let's check llama_1b_globals template parameters:
+    # <layers=16, hidden_dim=2048, intermediate_dim=8192, head_dim=64, num_attention_heads=32, num_kv_heads=8>
+    # In llama.cuh:
+    # qkv_weights_t: [layers, hidden_dim, (num_attention_heads + 2*num_kv_heads) * head_dim]
+    # -> (32 + 16) * 64 = 48 * 64 = 3072. Yes, this is 3072.
+    # What tensor is expecting 48 columns?
+    # Maybe rope_cos / rope_sin?
+    # In llama.cuh: using rope_t = kittens::gl<float, 1, 1, -1, head_dim / 2>; 
+    # Wait! head_dim / 2 = 64 / 2 = 32. 
+    # Ah, the error is "Column dimension mismatch. Expected: 48, Got: 1024". 
+    # If I passed dummy_rope = torch.zeros(1024, 32), then rows=1024, cols=32. 
+    # If the error expects 48, then something expects 48 columns.
+    # Let's look at `post_ln_rope_q`. In `llama.cuh`:
+    # using q_post_rope_t = kittens::gl<kittens::bf16, 1, 1, -1, (num_attention_heads + 2 * num_kv_heads) * head_dim>;
+    # No, wait. 48 could be num_attention_heads + 2 * num_kv_heads = 32 + 16 = 48.
+    # So `post_ln_rope_q` expects `48 * head_dim` columns?
+    # No, let's look at how PyBind11 binds it.
+    # In dispatch.py / bind_kernel, it binds:
+    # qkv_weights: [layers, hidden_dim, 48 * head_dim] -> shape is [16, 2048, 3072]
+    # wait, "Expected: 48, Got: 1024". 
+    # If Got is 1024, which tensor did I pass with 1024?
+    # dummy_rope = torch.zeros(1024, 32). This has shape (1024, 32).
+    # PyBind11 kittens::gl might be expecting a different layout.
+    # Let's look at `llama_1b_globals::rope_cos`. It is `kittens::gl<float, 1, 1, -1, head_dim / 2>`.
+    # So `rope_cos` should have `head_dim/2 = 32` columns.
+    # If the error is "Expected: 48, Got: 1024", maybe it's checking the *number of attention heads* or something?
+    # Wait, the only thing with 48 is `num_attention_heads + 2 * num_kv_heads = 48`.
+    # Let's check `post_ln_rope_q_t`. In `llama.cuh`:
+    # `using post_ln_rope_q_t = kittens::gl<kittens::bf16, 1, 1, -1, (num_attention_heads + 2 * num_kv_heads) * head_dim>;`?
+    # Let's just set all these 2D/3D tensors to shape (1024, 3072) to be safe, or look exactly at the shapes.
+    # To bypass PyBind11 checks perfectly, we just make them flat 1D tensors of sufficient size, or match exactly.
+    # Actually, `kittens::gl` checks `shape[-1]`.
+    # If `Got: 1024`, the only tensor where I put 1024 in the LAST dimension is NONE.
+    # Wait, what if PyBind11 sees `torch.zeros(1, 2048)` and thinks cols=2048?
+    # Which expected 48?
+    # `(num_attention_heads + 2*num_kv_heads) = 48`.
+    # Maybe `qkv_weights` shape was expected to be `[layers, hidden_dim, 48, head_dim]`?
+    # Let's check mk.py `interpret_with_mk`:
+    # It passes `globs.qkv_proj_weights`.
+    # Let's make dummy tensors very flexible.
+    
+    # Let's recreate all dummy tensors to match the EXACT shapes used in Llama 1B:
+    # layers = 16, hidden = 2048, intermediate = 8192, head_dim = 64, num_attn_heads = 32, num_kv_heads = 8
+    
+    dummy_qkv = torch.zeros(16, 2048, 48, 64, device=device, dtype=torch.bfloat16) # Expected: 48, Got: 1024? Ah! If I passed 3072, and it expected 48? No, 3072 / 64 = 48.
+    # It seems qkv_weights is [layers, hidden, 48, 64] in the original code!
+    dummy_o = torch.zeros(16, 2048, 32, 64, device=device, dtype=torch.bfloat16)
+    dummy_up = torch.zeros(16, 8192, 2048, device=device, dtype=torch.bfloat16)
+    dummy_down = torch.zeros(16, 2048, 8192, device=device, dtype=torch.bfloat16)
+    dummy_norm = torch.zeros(16, 2048, device=device, dtype=torch.bfloat16)
+    
+    dummy_k_cache = torch.zeros(1, 1024, 8, 64, device=device, dtype=torch.bfloat16)
+    dummy_v_cache = torch.zeros(1, 1024, 8, 64, device=device, dtype=torch.bfloat16)
+    dummy_rope = torch.zeros(1024, 32, device=device, dtype=torch.float32)
+    dummy_attn_out = torch.zeros(1024, 32, 64, device=device, dtype=torch.bfloat16)
+    dummy_lse = torch.zeros(1024, 32, device=device, dtype=torch.float32)
+    dummy_q_post_rope = torch.zeros(1024, 48, 64, device=device, dtype=torch.bfloat16)
+    dummy_logits = torch.zeros(1024, 100, device=device, dtype=torch.bfloat16)
     
     globs = Globals(
         qkv_proj_weights=dummy_qkv, o_proj_weights=dummy_o, attn_ln_weights=dummy_norm, mlp_ln_weights=dummy_norm,
@@ -69,8 +126,8 @@ def init_globals(device="cuda:0"):
         rope_cos=dummy_rope, rope_sin=dummy_rope,
         
         hidden_states=hidden_states,
-        post_ln_rope_q=dummy_attn_out, attn_out=dummy_attn_out, attn_lse_intermediates=dummy_lse, attn_out_intermediates=dummy_attn_out,
-        silu_out=dummy_norm, logits=dummy_norm,
+        post_ln_rope_q=dummy_q_post_rope, attn_out=dummy_attn_out, attn_lse_intermediates=dummy_lse, attn_out_intermediates=dummy_attn_out,
+        silu_out=dummy_norm, logits=dummy_logits,
         
         moe_up_proj_weights=moe_up,
         moe_gate_proj_weights=moe_gate,
