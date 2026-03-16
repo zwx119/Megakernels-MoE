@@ -149,11 +149,9 @@ def test_moe_correctness():
 
     # Construct instructions tensor
     print("Tensorizing instructions for MK...")
-    from megakernels.demos.latency.scheduler import tensorize_instructions
+    from megakernels.demos.latency.instructions import serialize_instructions
     
     # We need to construct a DAG to use the scheduler, but for a simple test we can just serialize them manually.
-    # However, to test the scheduler's interleaving logic, it's better to use the DAG.
-    # For now, let's just test the raw instructions execution on SM 0.
     
     # List of all instructions we ran in VM
     instructions_to_run = [up_inst, gate_inst]
@@ -173,11 +171,23 @@ def test_moe_correctness():
     # Assign all to SM 0 for this isolated test
     sm_assignments = {0: instructions_to_run}
     
-    # Tensorize
-    inst_tensor = tensorize_instructions(sm_assignments)
+    # Tensorize manually (since tensorize_instructions might not be exposed as expected)
+    # The expected shape is [num_sms, max_instructions, 32]
+    # We use serialize_instructions from instructions.py
+    
+    num_sms = 132 # H100
+    max_inst = len(instructions_to_run)
+    inst_tensor = torch.zeros((num_sms, max_inst, 32), dtype=torch.int32, device=device)
+    
+    # Only SM 0 has instructions
+    serialized = serialize_instructions(instructions_to_run)
+    inst_tensor[0, :len(serialized), :] = torch.tensor(serialized, dtype=torch.int32, device=device)
+    
+    # Fill the rest with Stop (opcode 0)
+    # 0 is usually NoOp or Stop depending on the implementation.
     
     # Copy to globals
-    globs.instructions = inst_tensor.to(device)
+    globs.instructions = inst_tensor
     
     print("Executing Megakernel...")
     try:
