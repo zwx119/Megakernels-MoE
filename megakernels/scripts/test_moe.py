@@ -148,16 +148,63 @@ def test_moe_correctness():
         return
 
     # Construct instructions tensor
-    # We need to serialize instructions and put them into globs.instructions
-    # This part usually happens in scheduler.tensorize_instructions
+    print("Tensorizing instructions for MK...")
+    from megakernels.demos.latency.scheduler import assign_dag_to_sms, tensorize_instructions
+    from megakernels.demos.latency.python_vm import DAG_Node
     
-    # For this simple test, we can just manually interpret if the interpreter supports list
-    # But mk_interpreter usually takes the whole globs with tensorized instructions.
+    # We need to construct a DAG to use the scheduler, but for a simple test we can just serialize them manually.
+    # However, to test the scheduler's interleaving logic, it's better to use the DAG.
+    # For now, let's just test the raw instructions execution on SM 0.
     
-    # Let's skip full MK run in this script and focus on logic verification first
-    # or assume the user will run this after compilation.
+    # List of all instructions we ran in VM
+    instructions_to_run = [up_inst, gate_inst]
+    for col_idx in range(num_col_splits):
+        instructions_to_run.append(
+            MoEExpertMatVec(
+                layer_idx=0, expert_idx=0, weight_type=2,
+                start_block_idx=0, end_block_idx=globs.hidden_size // globs.moe_block_size,
+                reduction_block_idx=col_idx
+            )
+        )
+        
+    # We must append a Stop instruction to tell the MK to exit
+    from megakernels.demos.latency.instructions import Stop
+    instructions_to_run.append(Stop())
+
+    # Assign all to SM 0 for this isolated test
+    sm_assignments = {0: instructions_to_run}
     
-    print("Test script generation complete. Please run this after compiling the kernel.")
+    # Tensorize
+    inst_tensor = tensorize_instructions(sm_assignments)
+    
+    # Copy to globals
+    globs.instructions = inst_tensor.to(device)
+    
+    print("Executing Megakernel...")
+    try:
+        interpreter(globs)
+        print("MK execution completed.")
+    except Exception as e:
+        print(f"Error during MK execution: {e}")
+        return
+
+    # Compare results
+    print("\n--- Comparing Results ---")
+    mk_hidden_states = globs.hidden_states.clone()
+    
+    # Note: Because of bfloat16 and different accumulation order, there might be slight numerical differences.
+    # We use a relatively loose tolerance.
+    diff = torch.abs(ref_hidden_states.float() - mk_hidden_states.float())
+    max_diff = diff.max().item()
+    
+    print(f"Max absolute difference in hidden_states: {max_diff:.6f}")
+    
+    if max_diff < 1e-2:
+        print("✅ SUCCESS: Megakernel MoE output matches Python VM!")
+    else:
+        print("❌ WARNING: Megakernel output differs significantly from Python VM.")
+        
+    print("\nTest complete.")
 
 if __name__ == "__main__":
     test_moe_correctness()
