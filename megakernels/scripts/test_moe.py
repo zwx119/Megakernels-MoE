@@ -150,8 +150,6 @@ def test_moe_correctness():
     # Construct instructions tensor
     print("Tensorizing instructions for MK...")
     
-    # We need to construct a DAG to use the scheduler, but for a simple test we can just serialize them manually.
-    
     # List of all instructions we ran in VM
     instructions_to_run = [up_inst, gate_inst]
     for col_idx in range(num_col_splits):
@@ -163,43 +161,31 @@ def test_moe_correctness():
             )
         )
         
-    # We must append a Stop instruction to tell the MK to exit
-    from megakernels.demos.latency.instructions import Stop
-    instructions_to_run.append(Stop())
-
     # Assign all to SM 0 for this isolated test
     # Tensorize manually: just call to_tensor() on each instruction
     num_sms = 132 # H100
-    max_inst = len(instructions_to_run)
+    max_inst = len(instructions_to_run) + 1 # +1 for the explicit Stop (opcode 0)
     inst_tensor = torch.zeros((num_sms, max_inst, 32), dtype=torch.int32, device=device)
     
     # Serialize each instruction
     for i, inst in enumerate(instructions_to_run):
-        # instructions usually have a to_tensor() or as_tensor() method, or we can just get their dict
-        # Actually, in MK they use to_tuple() or just serialize their fields.
-        # Let's look at the instruction definition. It's a dataclass.
-        # The CUDA struct expects: [opcode, ...fields...]
-        
-        if isinstance(inst, Stop):
-            fields = [0] * 32
-        elif isinstance(inst, MoEExpertMatVec):
-            fields = [
-                inst.opcode(),
-                inst.layer_idx,
-                inst.expert_idx,
-                inst.weight_type,
-                inst.start_block_idx,
-                inst.end_block_idx,
-                inst.reduction_block_idx
-            ]
-            # Pad to 32
-            fields += [0] * (32 - len(fields))
-        else:
-            fields = [0] * 32
+        fields = [
+            inst.opcode(),
+            inst.layer_idx,
+            inst.expert_idx,
+            inst.weight_type,
+            inst.start_block_idx,
+            inst.end_block_idx,
+            inst.reduction_block_idx
+        ]
+        # Pad to 32
+        fields += [0] * (32 - len(fields))
             
         inst_tensor[0, i, :] = torch.tensor(fields, dtype=torch.int32, device=device)
     
-    # Fill the rest with Stop (opcode 0)
+    # The last instruction is implicitly all 0s due to torch.zeros initialization,
+    # which corresponds to the NoOp/Stop instruction in MK.
+    
     # Copy to globals
     globs.instructions = inst_tensor
     
