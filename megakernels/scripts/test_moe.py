@@ -149,7 +149,6 @@ def test_moe_correctness():
 
     # Construct instructions tensor
     print("Tensorizing instructions for MK...")
-    from megakernels.demos.latency.instructions import serialize_instructions
     
     # We need to construct a DAG to use the scheduler, but for a simple test we can just serialize them manually.
     
@@ -169,23 +168,38 @@ def test_moe_correctness():
     instructions_to_run.append(Stop())
 
     # Assign all to SM 0 for this isolated test
-    sm_assignments = {0: instructions_to_run}
-    
-    # Tensorize manually (since tensorize_instructions might not be exposed as expected)
-    # The expected shape is [num_sms, max_instructions, 32]
-    # We use serialize_instructions from instructions.py
-    
+    # Tensorize manually: just call to_tensor() on each instruction
     num_sms = 132 # H100
     max_inst = len(instructions_to_run)
     inst_tensor = torch.zeros((num_sms, max_inst, 32), dtype=torch.int32, device=device)
     
-    # Only SM 0 has instructions
-    serialized = serialize_instructions(instructions_to_run)
-    inst_tensor[0, :len(serialized), :] = torch.tensor(serialized, dtype=torch.int32, device=device)
+    # Serialize each instruction
+    for i, inst in enumerate(instructions_to_run):
+        # instructions usually have a to_tensor() or as_tensor() method, or we can just get their dict
+        # Actually, in MK they use to_tuple() or just serialize their fields.
+        # Let's look at the instruction definition. It's a dataclass.
+        # The CUDA struct expects: [opcode, ...fields...]
+        
+        if isinstance(inst, Stop):
+            fields = [0] * 32
+        elif isinstance(inst, MoEExpertMatVec):
+            fields = [
+                inst.opcode(),
+                inst.layer_idx,
+                inst.expert_idx,
+                inst.weight_type,
+                inst.start_block_idx,
+                inst.end_block_idx,
+                inst.reduction_block_idx
+            ]
+            # Pad to 32
+            fields += [0] * (32 - len(fields))
+        else:
+            fields = [0] * 32
+            
+        inst_tensor[0, i, :] = torch.tensor(fields, dtype=torch.int32, device=device)
     
     # Fill the rest with Stop (opcode 0)
-    # 0 is usually NoOp or Stop depending on the implementation.
-    
     # Copy to globals
     globs.instructions = inst_tensor
     
