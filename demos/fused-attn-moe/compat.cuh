@@ -50,10 +50,16 @@ bit_cast(const From &src) noexcept {
 #endif // !std::bit_cast
 
 // 如果 CUDA 版本不支持 cudaLaunchAttributePreferredClusterDimension（需要 CUDA 12.3+），
-// 提供一个兼容定义。该 attribute 仅在 cluster launch 时使用，H100 单 SM 运行时不影响。
-#if CUDART_VERSION < 12030
-#ifndef cudaLaunchAttributePreferredClusterDimension
-#define cudaLaunchAttributePreferredClusterDimension ((cudaLaunchAttributeID)9)
-#endif
+// 提供一个兼容定义。该 attribute 仅在 cluster launch 时使用，单 SM kernel 不影响。
+//
+// cudaLaunchAttributePreferredClusterDimension 是 enum 值（不是宏），
+// 不能用 #ifndef 检测。需要先引入 cuda_runtime.h 获取 CUDART_VERSION。
+#include <cuda_runtime.h>
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12030
+// 旧版 CUDA 没有这个 enum 值，提供一个 inline constexpr 替代
+namespace {
+    constexpr cudaLaunchAttributeID cudaLaunchAttributePreferredClusterDimension =
+        static_cast<cudaLaunchAttributeID>(9);
+}
 #endif
 
