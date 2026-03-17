@@ -4,11 +4,21 @@ MK Interpreter for the fused Attention + MoE kernel.
 Bridges the Python scheduler output to the CUDA megakernel invocation.
 """
 
+import sys
+from pathlib import Path
+
 import torch
 from einops import rearrange
 
 from megakernels.demos.fused.instructions import FusedGlobals
 from megakernels.mk import MK_Interpreter
+
+
+def get_fused_mk_func(mk_dir: Path):
+    """Load the compiled fused megakernel shared object."""
+    sys.path.append(str(mk_dir.expanduser().absolute()))
+    from mk_fused_attn_moe import mk_fused_attn_moe  # type: ignore
+    return mk_fused_attn_moe
 
 
 def interpret_with_mk(
@@ -61,12 +71,16 @@ def interpret_with_mk(
         globs.batch_size,
         0,  # current_token_idx (set per-instruction in the kernel)
         -1,  # moe_token_idx (set per-instruction in the kernel)
+        globs.skip_attn_reduction,
         stream=torch.cuda.current_stream(),
     )
 
 
 class FusedMK_Interpreter(MK_Interpreter):
     """Interpreter that dispatches to the compiled fused megakernel."""
+
+    def __init__(self, mk_dir: Path):
+        self.mk_func = get_fused_mk_func(mk_dir)
 
     def interpret(self, globs: FusedGlobals):
         interpret_with_mk(globs, self.mk_func)
