@@ -66,6 +66,60 @@ using l_rv = col_vec<kittens::rt_fl<16, FUSED_HEAD_DIM>>;
 using l_sv = kittens::sv_fl<16>;
 
 // ============================================================================
+// store_4_rows: 从 16 行的 register tile 中提取 4 行到 4 个 shared vector
+// ============================================================================
+// 【说明】rt_fl<16, HEAD_DIM> 是一个 16 行的 tile，但 decode attention 中
+// 每个 Q head 只占 1 行。GQA_RATIO=4 个 heads 共占 4 行。
+// row4idx 指定取哪 4 行：0=rows 0~3, 1=rows 4~7, 2=rows 8~11, 3=rows 12~15
+//
+// 这个函数直接复用自 attention_partial.cu，处理 MMA 寄存器的特殊布局。
+template <kittens::ducks::sv::all SV, kittens::ducks::rt::all RT>
+__device__ static inline void
+store_4_rows(SV (&dst)[FUSED_GQA_RATIO], const RT &src, int row4idx) {
+    static_assert(RT::rows == 16, "src rows must be 16.");
+    static_assert(SV::length == src.cols, "dst length must match src cols.");
+
+    using T2 = typename RT::dtype;
+    using T = typename kittens::base_types::packing<T2>::unpacked_type;
+    using U = typename SV::dtype;
+    using U2 = typename kittens::base_types::packing<U>::packed_type;
+
+    uint32_t dst_ptr[FUSED_GQA_RATIO];
+    #pragma unroll
+    for (int i = 0; i < FUSED_GQA_RATIO; i++) {
+        dst_ptr[i] = static_cast<uint32_t>(__cvta_generic_to_shared(&dst[i].data[0]));
+    }
+
+    int laneid = kittens::warp::laneid();
+    int local_row_idx = (laneid % 16) / 4;
+    int local_col_idx = laneid % 4;
+
+    if (row4idx % 2 == 0 && laneid < 16) {           // rows 0~3 或 8~11
+        int data_idx_a = (row4idx / 2 == 0) ? 0 : 1; // row4idx=0 → data[0,2]  row4idx=2 → data[1,3]
+        int data_idx_b = data_idx_a + 2;
+        for (int j = 0; j < src.width; j++) {
+            U2 tmp[2];
+            tmp[0] = kittens::base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[data_idx_a]);
+            tmp[1] = kittens::base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[data_idx_b]);
+            int col_idx = local_col_idx * 2 + j * 16;
+            kittens::move<U2>::sts(dst_ptr[local_row_idx] + sizeof(U) * col_idx, tmp[0]);
+            kittens::move<U2>::sts(dst_ptr[local_row_idx] + sizeof(U) * (col_idx + 8), tmp[1]);
+        }
+    } else if (row4idx % 2 == 1 && laneid >= 16) {   // rows 4~7 或 12~15
+        int data_idx_a = (row4idx / 2 == 0) ? 0 : 1;
+        int data_idx_b = data_idx_a + 2;
+        for (int j = 0; j < src.width; j++) {
+            U2 tmp[2];
+            tmp[0] = kittens::base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[data_idx_a]);
+            tmp[1] = kittens::base_types::convertor<U2, T2>::convert(src.tiles[0][j].data[data_idx_b]);
+            int col_idx = local_col_idx * 2 + j * 16;
+            kittens::move<U2>::sts(dst_ptr[local_row_idx] + sizeof(U) * col_idx, tmp[0]);
+            kittens::move<U2>::sts(dst_ptr[local_row_idx] + sizeof(U) * (col_idx + 8), tmp[1]);
+        }
+    }
+}
+
+// ============================================================================
 // 常量定义
 // ============================================================================
 // 信号量索引
@@ -567,8 +621,11 @@ struct fused_attn_moe_op {
                 kittens::warp::neg_infty(L_reg);
             }
 
-            for (int h = 0; h < FUSED_GQA_RATIO; h++) {
-                kittens::warp::store(O_smem[h], O_reg);
+            // 【修正】rt_fl → sv_fl 需要用 store_4_rows 提取特定行
+            // store_4_rows 一次将 4 个 GQA heads 的 O 值写入 4 个 sv_fl
+            {
+                int q_head_local_idx = (q_head_start_idx % attn_q_rt::tile_size_row) / FUSED_GQA_RATIO;
+                store_4_rows(O_smem, O_reg, q_head_local_idx);
             }
             kittens::warp::sync();
             kittens::warp::arrive(sems_t::O_arrived(s));
