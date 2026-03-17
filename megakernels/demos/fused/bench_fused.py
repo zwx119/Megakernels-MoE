@@ -41,6 +41,15 @@ import torch.nn.functional as F
 
 
 # ============================================================================
+# 编译时常量
+# ============================================================================
+
+# main.cu 中 #ifndef KITTENS_BLACKWELL → sm_count=132
+# kernel 的 grid() 返回 dim3(sm_count)，因此指令/timing tensor 必须用编译时 SM count
+COMPILED_SM_COUNT = 132
+
+
+# ============================================================================
 # 模型配置
 # ============================================================================
 
@@ -79,124 +88,148 @@ class ModelConfig:
 # Tensor 创建工具
 # ============================================================================
 
-def get_sm_count(device="cuda:0"):
-    """获取 GPU 的 SM 数量。"""
-    props = torch.cuda.get_device_properties(device)
-    return props.multi_processor_count
-
-
 def create_model_tensors(config: ModelConfig, seq_len: int, batch_size: int = 1,
                          device="cuda:0"):
     """
     创建所有模型 tensor，模拟真实推理场景。
     所有 tensor 形状与 fused_globals_t 中的 gl<> 类型完全对齐。
+
+    pyutils.cuh 的 from_object<GL> 会将 tensor 左填充 1 到 4D 后检查：
+      - gl<T, B, D, R, C> 中 B/D/R/C > 0 的维度必须精确匹配
+      - -1 表示动态维度，不检查
+
+    【关键规则】
+      - gl<T, 1, ...> 的 batch=1 → 用 3D 或更低维 tensor（自动填充 batch=1）
+      - 如果传 4D tensor，第一维就是 batch，必须为 1
+      - gl<T, -1, -1, -1, C> 全动态 → 4D tensor 直接使用
     """
     dtype = torch.bfloat16
-    sm_count = get_sm_count(device)
     num_kv_blocks = math.ceil(seq_len / config.kv_block_size)
-    max_attn_partitions = sm_count
-    gqa_ratio = config.num_attention_heads // config.num_key_value_heads
+    total_heads = config.num_attention_heads + config.num_key_value_heads * 2
+    num_le = config.num_hidden_layers * config.num_experts
+
+    # 编译时 SM count 用于 intermediates 的尺寸
+    kernel_sm_count = COMPILED_SM_COUNT
+    lse_col_padded = ((kernel_sm_count + 15) // 16) * 16  # = 144
 
     tensors = {}
 
     # ---- VM 基础设施 ----
+    # barriers: gl<uint, 1, -1, -1, N>  N = total_heads = 48
+    # → 3D tensor [num_layers, 12, 48] → padded to [1, num_layers, 12, 48]  b=1 ✓
     tensors['barriers'] = torch.zeros(
-        [config.num_hidden_layers, 12,
-         config.num_attention_heads + config.num_key_value_heads * 2],
+        config.num_hidden_layers, 12, total_heads,
         dtype=torch.int32, device=device,
     )
-    # instructions & timings 由 tensorize_instructions() 填充
 
     # ---- QKV/O 权重 ----
     # weights_t = gl<bf16, 1, -1, -1, hidden_dim>
-    # QKV: [1, num_layers, blocks, hidden_dim] — 简化为随机
-    total_heads = config.num_attention_heads + config.num_key_value_heads * 2
-    qkv_blocks = total_heads  # 每个 head 1 个 block
+    # → 3D tensor [num_layers, out_features, hidden_dim]
+    # → padded to [1, num_layers, out_features, hidden_dim]  b=1 ✓
+    qkv_out_features = total_heads * config.head_dim  # (32+8+8)*64 = 3072
     tensors['qkv_weights'] = torch.randn(
-        config.num_hidden_layers, qkv_blocks, 4, config.hidden_size,
+        config.num_hidden_layers, qkv_out_features, config.hidden_size,
         device=device, dtype=dtype,
-    )
-    tensors['o_weights'] = torch.randn(
-        config.num_hidden_layers,
-        config.num_attention_heads * config.head_dim // config.matvec_block_size,
-        4, config.hidden_size,
+    ) * 0.01
+
+    # norm_weights_t = gl<bf16, 1, 1, -1, hidden_dim>
+    # → 2D tensor [num_layers, hidden_dim] → padded to [1, 1, num_layers, hidden_dim]
+    #   b=1 ✓, d=1 ✓
+    tensors['attn_norm_weights'] = torch.ones(
+        config.num_hidden_layers, config.hidden_size,
         device=device, dtype=dtype,
     )
 
-    # ---- Norm 权重 ----
-    tensors['attn_norm_weights'] = torch.randn(
-        config.num_hidden_layers, 1, config.hidden_size,
+    # o_weights: weights_t = gl<bf16, 1, -1, -1, hidden_dim>
+    o_out_features = config.num_attention_heads * config.head_dim  # 32*64 = 2048
+    tensors['o_weights'] = torch.randn(
+        config.num_hidden_layers, o_out_features, config.hidden_size,
         device=device, dtype=dtype,
-    )
-    tensors['mlp_norm_weights'] = torch.randn(
-        config.num_hidden_layers, 1, config.hidden_size,
+    ) * 0.01
+
+    tensors['mlp_norm_weights'] = torch.ones(
+        config.num_hidden_layers, config.hidden_size,
         device=device, dtype=dtype,
     )
 
     # ---- KV cache ----
-    # kv_cache_t = gl<bf16, -1, -1, -1, head_dim>
-    # 形状: [num_layers * num_kv_blocks, num_kv_heads, kv_block_size, head_dim]
+    # kv_cache_t = gl<bf16, -1, -1, -1, head_dim>  全动态
+    # → 4D tensor [num_layers * num_kv_blocks, num_kv_heads, kv_block_size, head_dim]
     tensors['k_cache'] = torch.randn(
         config.num_hidden_layers * num_kv_blocks,
         config.num_key_value_heads, config.kv_block_size, config.head_dim,
         device=device, dtype=dtype,
-    )
+    ) * 0.1
     tensors['v_cache'] = torch.randn(
         config.num_hidden_layers * num_kv_blocks,
         config.num_key_value_heads, config.kv_block_size, config.head_dim,
         device=device, dtype=dtype,
-    )
+    ) * 0.1
 
     # ---- RoPE ----
-    tensors['rope_cos'] = torch.randn(
-        seq_len + 1, config.head_dim,
+    # rope_table_t = gl<float, 1, 1, -1, head_dim=64>
+    # → 2D tensor [seq_len, head_dim] → padded to [1, 1, seq_len, head_dim]
+    tensors['rope_cos'] = torch.ones(
+        seq_len + 16, config.head_dim,
         device=device, dtype=torch.float32,
     )
-    tensors['rope_sin'] = torch.randn(
-        seq_len + 1, config.head_dim,
+    tensors['rope_sin'] = torch.zeros(
+        seq_len + 16, config.head_dim,
         device=device, dtype=torch.float32,
     )
 
     # ---- Activation 缓冲区 ----
+    # activations_t = gl<bf16, 1, 1, 1, hidden_dim>  所有维度固定
+    # → 1D tensor [hidden_dim] → padded to [1, 1, 1, hidden_dim]
     tensors['hidden_states'] = torch.randn(
         config.hidden_size, device=device, dtype=dtype,
-    )
+    ) * 0.1
     tensors['q_post_rope'] = torch.randn(
         config.hidden_size, device=device, dtype=dtype,
-    )
+    ) * 0.1
     tensors['attn_out'] = torch.zeros(
         config.hidden_size, device=device, dtype=dtype,
     )
+
+    # attn_lse_intermediates_t = gl<float, 1, 1, num_attention_heads=32, -1>
+    # → 2D tensor [32, lse_col_padded] → padded to [1, 1, 32, lse_col_padded]
+    #   b=1 ✓, d=1 ✓, r=32 ✓
     tensors['attn_lse_intermediates'] = torch.zeros(
-        config.num_attention_heads, max_attn_partitions,
+        config.num_attention_heads, lse_col_padded,
         device=device, dtype=torch.float32,
     )
+
+    # attn_out_intermediates_t = gl<float, 1, num_attention_heads=32, -1, head_dim=64>
+    # → 3D tensor [32, kernel_sm_count, 64] → padded to [1, 32, kernel_sm_count, 64]
+    #   b=1 ✓, d=32 ✓
     tensors['attn_out_intermediates'] = torch.zeros(
-        config.num_attention_heads, max_attn_partitions, config.head_dim,
+        config.num_attention_heads, kernel_sm_count, config.head_dim,
         device=device, dtype=torch.float32,
     )
 
     # ---- MoE 权重 ----
-    # moe_weights_t = gl<bf16, -1, -1, -1, hidden_dim>
-    num_layers_x_experts = config.num_hidden_layers * config.num_experts
-    moe_up_blocks = config.intermediate_size // config.matvec_block_size
-    moe_down_blocks = config.hidden_size // config.matvec_block_size
-
+    # moe_weights_t = gl<bf16, -1, -1, -1, hidden_dim>  全动态
+    # → 3D tensor [num_layers*num_experts, out_features, hidden_dim]
+    # → padded to [1, le, out_features, hidden_dim]
+    up_out_features = config.intermediate_size  # 8192
+    down_out_features = config.hidden_size      # 2048
     tensors['moe_up_weights'] = torch.randn(
-        num_layers_x_experts, moe_up_blocks, 4, config.hidden_size,
+        num_le, up_out_features, config.hidden_size,
         device=device, dtype=dtype,
-    )
+    ) * 0.01
     tensors['moe_gate_weights'] = torch.randn(
-        num_layers_x_experts, moe_up_blocks, 4, config.hidden_size,
+        num_le, up_out_features, config.hidden_size,
         device=device, dtype=dtype,
-    )
+    ) * 0.01
     # moe_weights_big_t = gl<bf16, -1, -1, -1, intermediate_dim>
     tensors['moe_down_weights'] = torch.randn(
-        num_layers_x_experts, moe_down_blocks, 4, config.intermediate_size,
+        num_le, down_out_features, config.intermediate_size,
         device=device, dtype=dtype,
-    )
+    ) * 0.01
 
     # ---- MoE Routing ----
+    # routing_t = gl<int, 1, 1, -1, num_experts_per_tok=2>
+    # → 2D tensor [num_layers, 2] → padded to [1, 1, num_layers, 2]
     tensors['moe_expert_indices'] = torch.randint(
         0, config.num_experts,
         (config.num_hidden_layers, config.num_experts_per_tok),
@@ -209,17 +242,25 @@ def create_model_tensors(config: ModelConfig, seq_len: int, batch_size: int = 1,
     )
 
     # ---- MoE 中间缓冲 ----
+    # activations_big_indim_t = gl<bf16, 1, 1, 1, intermediate_dim=8192>
+    # → 1D tensor [8192]
     tensors['moe_intermediate'] = torch.zeros(
         config.intermediate_size, device=device, dtype=dtype,
     )
 
     # ---- 融合特有字段 ----
+    # attn_done_barrier_t = gl<int, 1, 1, 1, -1>
+    # → 1D tensor [batch_size]
     tensors['attn_done_barrier'] = torch.zeros(
         batch_size, device=device, dtype=torch.int32,
     )
+    # moe_input_activations_t = gl<bf16, 1, 1, -1, hidden_dim=2048>
+    # → 2D tensor [batch_size, hidden_dim]
     tensors['moe_input_activations'] = torch.randn(
         batch_size, config.hidden_size, device=device, dtype=dtype,
-    )
+    ) * 0.1
+    # moe_output_accumulator_t = gl<float, 1, 1, -1, hidden_dim=2048>
+    # → 2D tensor [batch_size, hidden_dim]
     tensors['moe_output_accumulator'] = torch.zeros(
         batch_size, config.hidden_size, device=device, dtype=torch.float32,
     )
@@ -414,9 +455,9 @@ def reference_attention_full(
 
 def reference_moe_forward(
     input_act: torch.Tensor,    # [hidden_size]
-    moe_up: torch.Tensor,       # [num_experts, intermediate/block, 4, hidden]
+    moe_up: torch.Tensor,       # [le, intermediate, hidden]
     moe_gate: torch.Tensor,     # same
-    moe_down: torch.Tensor,     # [num_experts, hidden/block, 4, intermediate]
+    moe_down: torch.Tensor,     # [le, hidden, intermediate]
     expert_indices: torch.Tensor,  # [num_experts_per_tok]
     expert_weights: torch.Tensor,  # [num_experts_per_tok]
     config: ModelConfig,
@@ -739,20 +780,26 @@ def main():
     device = args.device
     torch.cuda.set_device(device)
     props = torch.cuda.get_device_properties(device)
-    sm_count = props.multi_processor_count
+    hw_sm_count = props.multi_processor_count
+
+    # kernel 编译时的 SM count — grid 大小 = COMPILED_SM_COUNT
+    # 指令和 timing tensor 必须匹配这个大小
+    kernel_sm_count = COMPILED_SM_COUNT
 
     print("=" * 70)
     print("  融合 Attention + MoE Megakernel — 端到端 CUDA 性能测试")
     print("=" * 70)
-    print(f"  GPU:        {props.name}")
-    print(f"  SM Count:   {sm_count}")
-    print(f"  CUDA:       {torch.version.cuda}")
-    print(f"  PyTorch:    {torch.__version__}")
-    print(f"  Seq Length: {args.seq_len}")
-    print(f"  Batch Size: {args.batch_size}")
-    print(f"  Layers:     {args.num_layers}")
-    print(f"  Warmup:     {args.warmup}")
-    print(f"  Iters:      {args.iters}")
+    print(f"  GPU:           {props.name}")
+    print(f"  HW SM Count:   {hw_sm_count}")
+    print(f"  Kernel SMs:    {kernel_sm_count} (compiled)")
+    print(f"  VRAM:          {props.total_memory // 1024**3} GB")
+    print(f"  CUDA:          {torch.version.cuda}")
+    print(f"  PyTorch:       {torch.__version__}")
+    print(f"  Seq Length:    {args.seq_len}")
+    print(f"  Batch Size:    {args.batch_size}")
+    print(f"  Layers:        {args.num_layers}")
+    print(f"  Warmup:        {args.warmup}")
+    print(f"  Iters:         {args.iters}")
     print()
 
     # ---- 加载 kernel ----
@@ -784,25 +831,25 @@ def main():
 
         # ---- 正确性验证 ----
         if not args.skip_correctness:
-            test_correctness(mk_func, tensors, config, seq_len, sm_count, device)
+            test_correctness(mk_func, tensors, config, seq_len, kernel_sm_count, device)
 
         # ---- 生成指令 (Attention only, layer 0) ----
         instructions_attn_only = create_fused_instructions(
-            config, seq_len, sm_count, args.batch_size,
+            config, seq_len, kernel_sm_count, args.batch_size,
             layer_idx=0, moe_ready_tokens=None,
         )
         inst_tensor_attn, timing_tensor_attn = tensorize_instructions_for_sms(
-            instructions_attn_only, sm_count, device,
+            instructions_attn_only, kernel_sm_count, device,
         )
 
         # ---- 生成指令 (Fused Attention + MoE, layer 1) ----
         moe_ready = list(range(args.batch_size))
         instructions_fused = create_fused_instructions(
-            config, seq_len, sm_count, args.batch_size,
+            config, seq_len, kernel_sm_count, args.batch_size,
             layer_idx=0, moe_ready_tokens=moe_ready,
         )
         inst_tensor_fused, timing_tensor_fused = tensorize_instructions_for_sms(
-            instructions_fused, sm_count, device,
+            instructions_fused, kernel_sm_count, device,
         )
 
         print(f"  指令统计:")
