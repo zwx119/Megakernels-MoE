@@ -14,10 +14,17 @@ ifndef PYTHON_VERSION
 PYTHON_VERSION=3.13
 endif
 
+# 自动推断项目根目录（无需手动设置环境变量）
+# 当前文件位于 demos/fused-attn-moe/，向上两级即为项目根目录
+MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+PROJECT_ROOT := $(abspath $(MAKEFILE_DIR)/../..)
+THUNDERKITTENS_ROOT ?= $(PROJECT_ROOT)/ThunderKittens
+MEGAKERNELS_ROOT ?= $(PROJECT_ROOT)
+
 NVCCFLAGS=-DNDEBUG -Xcompiler=-fPIE --expt-extended-lambda --expt-relaxed-constexpr -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing --use_fast_math -forward-unknown-to-host-compiler -O3 -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills -std=c++20 -x cu -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static -lcublas -lineinfo
 # 兼容性补丁：为不支持 std::bit_cast 的旧 GCC 提供 polyfill
 NVCCFLAGS+= -include $(CURDIR)/compat.cuh
-NVCCFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${MEGAKERNELS_ROOT}/include $(shell python3 -m pybind11 --includes) $(shell python3-config --ldflags) -shared -fPIC -lpython${PYTHON_VERSION}
+NVCCFLAGS+= -I$(THUNDERKITTENS_ROOT)/include -I$(MEGAKERNELS_ROOT)/include $(shell python3 -m pybind11 --includes) $(shell python3-config --ldflags) -shared -fPIC -lpython$(PYTHON_VERSION)
 
 # Conditional setup based on the target GPU
 ifeq ($(GPU),4090)
