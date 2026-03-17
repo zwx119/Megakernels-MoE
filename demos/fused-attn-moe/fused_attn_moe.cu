@@ -431,7 +431,7 @@ struct fused_attn_moe_op {
                         case 2:
                             kittens::tma::load_async<kittens::dim::ROW, kittens::cache_policy::EVICT_FIRST>(
                                 weight_chunk, g.moe_down_weights,
-                                {row_idx, block_idx,
+                                coord<>{row_idx, block_idx,
                                  inst.moe_reduction_block * Globals::hidden_dim + col * 512},
                                 sem);
                             break;
@@ -663,25 +663,23 @@ struct fused_attn_moe_op {
             moe_rv_t activations_vec;
 
             {
-                kittens::bf16 *src;
-                if (inst.moe_weight_type == 2) {
-                    int offset = inst.moe_reduction_block * FUSED_HIDDEN_DIM +
-                                 local_moe_warp_id * RED_DIM;
-                    src = &g.moe_intermediate.raw_ptr[offset];
-                } else {
-                    int offset = inst.moe_token_idx * FUSED_HIDDEN_DIM +
-                                 local_moe_warp_id * RED_DIM;
-                    src = g.moe_input_activations.raw_ptr + offset;
-                }
-
                 // 加载到共享内存临时区域，再加载到寄存器
-                // 使用 pages[10] 作为临时 activation 缓冲
+                // 使用 activation page 作为临时缓冲
                 int act_pid = s.pid(PAGE_MOE_W_START + MOE_PIPELINE_STAGES * MOE_STAGE_PAGES);
                 using act_sv_t = kittens::sv_bf<RED_DIM>;
                 act_sv_t &act_smem = reinterpret_cast<act_sv_t *>(
                     s.pages[act_pid].ptr())[local_moe_warp_id];
 
-                kittens::warp::load(act_smem, *reinterpret_cast<kittens::gl<kittens::bf16, 1, 1, 1, RED_DIM> *>(src), {});
+                if (inst.moe_weight_type == 2) {
+                    // down_proj: 从 moe_intermediate 加载
+                    kittens::warp::load(act_smem, g.moe_intermediate,
+                        coord<>{inst.moe_reduction_block * Globals::hidden_dim +
+                                local_moe_warp_id * RED_DIM});
+                } else {
+                    // up/gate: 从 moe_input_activations 加载
+                    kittens::warp::load(act_smem, g.moe_input_activations,
+                        coord<>{inst.moe_token_idx, local_moe_warp_id * RED_DIM});
+                }
 
                 // 转换 bf16 → fp32
                 kittens::warp::load(activations_vec, act_smem);
