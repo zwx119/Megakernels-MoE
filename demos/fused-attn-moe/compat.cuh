@@ -52,14 +52,8 @@ bit_cast(const From &src) noexcept {
 // 如果 CUDA 版本不支持 cudaLaunchAttributePreferredClusterDimension（需要 CUDA 12.3+），
 // 提供一个兼容定义。该 attribute 仅在 cluster launch 时使用，单 SM kernel 不影响。
 //
-// cudaLaunchAttributePreferredClusterDimension 是 enum 值（不是宏），
-// 不能用 #ifndef 检测。需要先引入 cuda_runtime.h 获取 CUDART_VERSION。
-#include <cuda_runtime.h>
-#if !defined(CUDART_VERSION) || CUDART_VERSION < 12030
-// 旧版 CUDA 没有这个 enum 值，提供一个 inline constexpr 替代
-namespace {
-    constexpr cudaLaunchAttributeID cudaLaunchAttributePreferredClusterDimension =
-        static_cast<cudaLaunchAttributeID>(9);
-}
-#endif
+// 用 #define 宏注入，在 ThunderKittens util.cuh 引用该符号之前生效。
+// 由于该符号是 enum 值而非宏，无法用 #ifndef 检测，这里直接无条件定义。
+// 如果你的 CUDA >= 12.3 已有此符号，请删除下面这行。
+#define cudaLaunchAttributePreferredClusterDimension ((cudaLaunchAttributeID)9)
 

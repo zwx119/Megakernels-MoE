@@ -227,17 +227,22 @@ struct fused_globals_t {
 
     // ========== 融合特有字段 ==========
 
-    // Token 级别的 attention 完成屏障
-    // attn_done_barrier[token_idx] 在该 token 的 attention 完成时原子递增
-    // MoE warps 通过轮询此值来判断是否可以开始 MoE 计算
-    int *attn_done_barrier;  // [max_batch_size]
+    // 融合特有 gl 类型（pybind11 要求使用 gl 而非裸指针，否则 cast 会失败）
+    // attn_done_barrier: [1, 1, 1, max_batch_size] int32
+    //   token 级别的 attention 完成屏障，MoE warps 通过轮询此值判断是否可以开始 MoE 计算
+    using attn_done_barrier_t = kittens::gl<int, 1, 1, 1, -1>;
 
-    // 已完成 attention 的 token 的输入激活值（post O-proj + residual）
-    // MoE warps 从这里读取输入
-    kittens::bf16 *moe_input_activations;  // [max_batch_size, hidden_dim]
+    // moe_input_activations: [1, 1, max_batch_size, hidden_dim] bf16
+    //   已完成 attention 的 token 的输入激活值（post O-proj + residual）
+    using moe_input_activations_t = kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim>;
 
-    // MoE 输出累加器（多个 expert 的结果通过 atomicAdd 累加）
-    float *moe_output_accumulator;  // [max_batch_size, hidden_dim]
+    // moe_output_accumulator: [1, 1, max_batch_size, hidden_dim] float
+    //   MoE 输出累加器（多个 expert 的结果通过 atomicAdd 累加）
+    using moe_output_accumulator_t = kittens::gl<float, 1, 1, -1, hidden_dim>;
+
+    attn_done_barrier_t attn_done_barrier;
+    moe_input_activations_t moe_input_activations;
+    moe_output_accumulator_t moe_output_accumulator;
 
     // --- 标量 ---
     unsigned int pos_id;

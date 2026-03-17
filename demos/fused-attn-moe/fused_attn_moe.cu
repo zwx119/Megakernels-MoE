@@ -635,8 +635,8 @@ struct fused_attn_moe_op {
             kittens::warp::arrive(sems_t::L_arrived(s));
 
             // 标记 attention 完成
-            if (kittens::laneid() == 0 && g.attn_done_barrier != nullptr) {
-                atomicAdd(&g.attn_done_barrier[g.current_token_idx], 1);
+            if (kittens::laneid() == 0 && g.attn_done_barrier.raw_ptr != nullptr) {
+                atomicAdd(&g.attn_done_barrier.raw_ptr[g.current_token_idx], 1);
             }
         }
 
@@ -647,8 +647,8 @@ struct fused_attn_moe_op {
                                              inst_t &inst) {
             // 等待目标 token 的 attention 完成
             if (local_moe_warp_id == 0 && kittens::laneid() == 0) {
-                while (g.attn_done_barrier != nullptr &&
-                       *(volatile int *)&g.attn_done_barrier[inst.moe_token_idx] < 1) {
+                while (g.attn_done_barrier.raw_ptr != nullptr &&
+                       *(volatile int *)&g.attn_done_barrier.raw_ptr[inst.moe_token_idx] < 1) {
                     __nanosleep(Config::GMEM_SPIN_LOOP_SLEEP_NANOS);
                 }
             }
@@ -671,7 +671,7 @@ struct fused_attn_moe_op {
                 } else {
                     int offset = inst.moe_token_idx * FUSED_HIDDEN_DIM +
                                  local_moe_warp_id * RED_DIM;
-                    src = g.moe_input_activations + offset;
+                    src = g.moe_input_activations.raw_ptr + offset;
                 }
 
                 // 加载到共享内存临时区域，再加载到寄存器
@@ -856,7 +856,7 @@ struct fused_attn_moe_op {
                     kittens::warp::sync();
 
                     if (laneid == 0) {
-                        float *out_ptr = g.moe_output_accumulator +
+                        float *out_ptr = g.moe_output_accumulator.raw_ptr +
                                           inst.moe_token_idx * FUSED_HIDDEN_DIM +
                                           block_idx * 16;
                         for (int j = 0; j < 16; j++) {
