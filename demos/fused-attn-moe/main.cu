@@ -45,10 +45,12 @@ using fused_globals = fused_globals_t<
     FUSED_NUM_KV_HEADS,        // 8
     FUSED_KV_BLOCK_SIZE,       // 16
     16,                        // matvec_block_size
-#ifndef KITTENS_BLACKWELL
-    132,                       // H100 SM count
-#else
+#if defined(KITTENS_BLACKWELL)
     148,                       // B200 SM count
+#elif defined(FUSED_SM_COUNT)
+    FUSED_SM_COUNT,            // 用户自定义 SM count（例如 H20=78）
+#else
+    132,                       // H100 SM count (默认)
 #endif
     FUSED_NUM_EXPERTS,         // 8
     FUSED_NUM_EXPERTS_PER_TOK  // 2

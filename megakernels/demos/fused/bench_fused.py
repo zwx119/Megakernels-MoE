@@ -44,9 +44,11 @@ import torch.nn.functional as F
 # 编译时常量
 # ============================================================================
 
-# main.cu 中 #ifndef KITTENS_BLACKWELL → sm_count=132
-# kernel 的 grid() 返回 dim3(sm_count)，因此指令/timing tensor 必须用编译时 SM count
-COMPILED_SM_COUNT = 132
+# main.cu 中通过 FUSED_SM_COUNT 宏或默认值决定
+# kernel 的 grid() 返回 dim3(sm_count)，指令/timing tensor 必须用编译时 SM count
+# get_worker_id() 返回 smid（硬件 SM ID），所以必须与实际硬件 SM 数匹配！
+# 设为 0 表示运行时自动用硬件 SM count
+COMPILED_SM_COUNT = 0  # 0 = 自动检测
 
 
 # ============================================================================
@@ -88,8 +90,8 @@ class ModelConfig:
 # Tensor 创建工具
 # ============================================================================
 
-def create_model_tensors(config: ModelConfig, seq_len: int, batch_size: int = 1,
-                         device="cuda:0"):
+def create_model_tensors(config: ModelConfig, seq_len: int, kernel_sm_count: int,
+                         batch_size: int = 1, device="cuda:0"):
     """
     创建所有模型 tensor，模拟真实推理场景。
     所有 tensor 形状与 fused_globals_t 中的 gl<> 类型完全对齐。
@@ -109,8 +111,7 @@ def create_model_tensors(config: ModelConfig, seq_len: int, batch_size: int = 1,
     num_le = config.num_hidden_layers * config.num_experts
 
     # 编译时 SM count 用于 intermediates 的尺寸
-    kernel_sm_count = COMPILED_SM_COUNT
-    lse_col_padded = ((kernel_sm_count + 15) // 16) * 16  # = 144
+    lse_col_padded = ((kernel_sm_count + 15) // 16) * 16
 
     tensors = {}
 
@@ -782,9 +783,9 @@ def main():
     props = torch.cuda.get_device_properties(device)
     hw_sm_count = props.multi_processor_count
 
-    # kernel 编译时的 SM count — grid 大小 = COMPILED_SM_COUNT
-    # 指令和 timing tensor 必须匹配这个大小
-    kernel_sm_count = COMPILED_SM_COUNT
+    # kernel 编译时的 SM count — get_worker_id() = smid，必须匹配硬件
+    # COMPILED_SM_COUNT=0 表示自动使用硬件值
+    kernel_sm_count = COMPILED_SM_COUNT if COMPILED_SM_COUNT > 0 else hw_sm_count
 
     print("=" * 70)
     print("  融合 Attention + MoE Megakernel — 端到端 CUDA 性能测试")
@@ -827,7 +828,7 @@ def main():
         print("=" * 70)
 
         # ---- 创建 tensor ----
-        tensors = create_model_tensors(config, seq_len, args.batch_size, device)
+        tensors = create_model_tensors(config, seq_len, kernel_sm_count, args.batch_size, device)
 
         # ---- 正确性验证 ----
         if not args.skip_correctness:

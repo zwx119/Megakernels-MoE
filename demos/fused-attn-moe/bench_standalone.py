@@ -39,9 +39,11 @@ NUM_EXPERTS_PER_TOK = 2
 NUM_LAYERS = 16  # FUSED_NUM_LAYERS in main.cu
 RMS_NORM_EPS = 1e-5
 GQA_RATIO = NUM_ATTENTION_HEADS // NUM_KV_HEADS
-# 编译时写死的 SM count（main.cu 中 #ifndef KITTENS_BLACKWELL → 132）
-# kernel 的 grid() 返回 dim3(sm_count)，所以指令/timing tensor 必须用编译时 SM count
-COMPILED_SM_COUNT = 132
+# 编译时写死的 SM count（main.cu 中通过 FUSED_SM_COUNT 宏或默认值决定）
+# kernel 的 grid() 返回 dim3(sm_count)，指令/timing tensor 必须用编译时 SM count
+# get_worker_id() 返回 smid（硬件 SM ID），所以必须与实际硬件 SM 数匹配！
+# 如果不确定编译时用的值，设为 0 表示运行时自动用硬件 SM count
+COMPILED_SM_COUNT = 0  # 0 = 自动检测（使用硬件 SM 数量）
 
 INTS_PER_INSTRUCTION = 32
 OPCODE_FUSED = 9
@@ -67,7 +69,7 @@ def load_kernel():
 # 创建 GPU Tensors
 # ============================================================================
 
-def create_tensors(seq_len, batch_size=1, device="cuda:0"):
+def create_tensors(seq_len, kernel_sm_count, batch_size=1, device="cuda:0"):
     """
     创建所有必需的 GPU tensors。
     形状必须与 fused_globals_t 中 gl<> 类型完全匹配。
@@ -87,7 +89,7 @@ def create_tensors(seq_len, batch_size=1, device="cuda:0"):
     num_le = NUM_LAYERS * NUM_EXPERTS
 
     # 编译时 SM count 用于 LSE intermediates 的 column padding
-    lse_col_padded = ((COMPILED_SM_COUNT + 15) // 16) * 16  # = 144
+    lse_col_padded = ((kernel_sm_count + 15) // 16) * 16
 
     t = {}
 
@@ -147,10 +149,10 @@ def create_tensors(seq_len, batch_size=1, device="cuda:0"):
         NUM_ATTENTION_HEADS, lse_col_padded, device=device, dtype=torch.float32)
 
     # attn_out_intermediates_t = gl<float, 1, num_attention_heads=32, -1, head_dim=64>
-    # → 3D tensor [32, compiled_sm_count, 64] → padded to [1, 32, compiled_sm_count, 64]
+    # → 3D tensor [32, kernel_sm_count, 64] → padded to [1, 32, kernel_sm_count, 64]
     #   b=1 ✓, d=32 ✓
     t['attn_out_intermediates'] = torch.zeros(
-        NUM_ATTENTION_HEADS, COMPILED_SM_COUNT, HEAD_DIM,
+        NUM_ATTENTION_HEADS, kernel_sm_count, HEAD_DIM,
         device=device, dtype=torch.float32)
 
     # ---- MoE 权重 ----
@@ -450,9 +452,10 @@ def main():
     props = torch.cuda.get_device_properties(device)
     hw_sm_count = props.multi_processor_count
 
-    # kernel 编译时的 SM count — grid 大小 = COMPILED_SM_COUNT
-    # 指令和 timing tensor 必须匹配这个大小
-    kernel_sm_count = COMPILED_SM_COUNT
+    # kernel 编译时的 SM count — grid 大小 = sm_count
+    # get_worker_id() 返回 smid（硬件 SM ID），所以编译时 sm_count 必须 == 硬件 SM 数
+    # COMPILED_SM_COUNT=0 表示自动使用硬件值
+    kernel_sm_count = COMPILED_SM_COUNT if COMPILED_SM_COUNT > 0 else hw_sm_count
 
     print("╔" + "═" * 68 + "╗")
     print("║  融合 Attention + MoE Megakernel — CUDA 端到端性能测试           ║")
@@ -484,7 +487,7 @@ def main():
         print("━" * 70)
 
         num_kv_blocks = math.ceil(seq_len / KV_BLOCK_SIZE)
-        t = create_tensors(seq_len, args.batch_size, device)
+        t = create_tensors(seq_len, kernel_sm_count, args.batch_size, device)
 
         # ---- Correctness ----
         if not args.skip_correctness:
