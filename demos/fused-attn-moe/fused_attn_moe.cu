@@ -303,12 +303,17 @@ struct fused_attn_moe_op {
                 init_semaphore(sems_t::V_finished(s, i), 0, 1);
             }
             // MoE 信号量
-            init_semaphore(sems_t::moe_act_arrived(s), 0, 1);
+            // moe_act_arrived: loader arrive 1次（普通 thread arrive），thread_count=1
+            init_semaphore(sems_t::moe_act_arrived(s), 1);
             for (int i = 0; i < MOE_PIPELINE_STAGES; i++) {
-                init_semaphore(sems_t::moe_w_arrived(s, i), 0, 1);
-                init_semaphore(sems_t::moe_w_finished(s, i), 0, FUSED_MOE_CONSUMER_WARPS);
-                init_semaphore(sems_t::moe_out_arrived(s, i), 0, FUSED_MOE_CONSUMER_WARPS);
-                init_semaphore(sems_t::moe_out_finished(s, i), 0, 1);
+                // moe_w_arrived: loader 用 tma::expect_bytes + TMA load，thread_count=1
+                init_semaphore(sems_t::moe_w_arrived(s, i), 1);
+                // moe_w_finished: 8个 consumer warp 各 arrive 1次，thread_count=8
+                init_semaphore(sems_t::moe_w_finished(s, i), FUSED_MOE_CONSUMER_WARPS);
+                // moe_out_arrived: 8个 consumer warp 各 arrive 1次，thread_count=8
+                init_semaphore(sems_t::moe_out_arrived(s, i), FUSED_MOE_CONSUMER_WARPS);
+                // moe_out_finished: storer arrive 1次，thread_count=1
+                init_semaphore(sems_t::moe_out_finished(s, i), 1);
             }
             return 24;
         }
@@ -407,7 +412,7 @@ struct fused_attn_moe_op {
             for (int iter = 0; iter < num_iters; iter++) {
                 if (iter >= MOE_PIPELINE_STAGES) {
                     kittens::wait(sems_t::moe_w_finished(s, input_stage),
-                                  (iter / MOE_PIPELINE_STAGES - 1) % 2);
+                                  (iter / MOE_PIPELINE_STAGES) % 2);
                 }
 
                 auto &sem = sems_t::moe_w_arrived(s, input_stage);
