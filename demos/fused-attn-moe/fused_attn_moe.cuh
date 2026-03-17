@@ -90,11 +90,11 @@
 // ============================================================================
 // Warp 分配常量
 // ============================================================================
-// 所有 16 个 consumer warp 都参与 MoE（与 low-latency-llama 保持一致）
-// attention 只使用 warp 0（decode 模式下单 Q head，不需要更多 warp）
-// 这样 RED_DIM = hidden_dim / 16 = 128，matvec 内部 rt_fl<16,128>，寄存器压力合理
-constexpr int FUSED_ATTN_CONSUMER_WARPS = 1;   // 只有 warp 0 做 attention
-constexpr int FUSED_MOE_CONSUMER_WARPS  = 16;  // warp 0~15: 全部参与 MoE
+// warp 0~7:  attention consumer（8 个 warp 并行处理 8 个 Q head partition）
+// warp 8~15: MoE consumer（8 个 warp 协作，RED_DIM=256，但内部拆成 2×128 累加）
+// 两组 warp 并发执行，构成 attention ↔ MoE 跨 instruction 流水线
+constexpr int FUSED_ATTN_CONSUMER_WARPS = 8;   // warp 0~7: attention
+constexpr int FUSED_MOE_CONSUMER_WARPS  = 8;   // warp 8~15: MoE
 
 // GQA 比例: 每个 KV head 对应多少 Q heads
 constexpr int FUSED_GQA_RATIO = FUSED_NUM_ATTENTION_HEADS / FUSED_NUM_KV_HEADS;

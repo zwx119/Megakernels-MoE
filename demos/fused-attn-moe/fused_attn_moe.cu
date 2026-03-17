@@ -465,22 +465,29 @@ struct fused_attn_moe_op {
     // ========================================================================
     // Consumer: 融合执行的核心
     // ========================================================================
-    // 【设计】
-    //   warpid == 0 → attention_consumer（单 warp 做 decode attention）
-    //   warpid 0~15 → moe_consumer（全部 16 个 warp 协作，RED_DIM=128，寄存器压力合理）
-    //   注意：attention 和 MoE 是同一批 warp 的不同任务，attention 完成后 warp 0 也参与 MoE
+    // 【流水线设计】
+    //   warp 0~7  → attention_consumer（并发处理 attention 部分）
+    //   warp 8~15 → moe_consumer（并发处理 MoE 部分）
+    //   两组 warp 独立并发，不同 SM 上同时运行不同 instruction，形成流水线：
+    //     SM_i:  instruction_n  (attention + MoE 同时进行)
+    //     SM_j:  instruction_n+1 (下一条 instruction 的 attention 正在进行)
+    // 【寄存器优化】
+    //   RED_DIM = 2048/8 = 256，但 matvec 内部把 256 列拆为 2×128 子块累加
+    //   每次 matvec 只需 rt_fl<16,128> = 64 floats/lane，消除寄存器溢出
     struct consumer {
         static __device__ void run(const Globals &g, megakernel::state<Config> &s) {
             int warp_id = kittens::warpid();
 
-            // warp 0 先做 attention，其余 warp 等待 attention 完成后一起做 MoE
-            if (warp_id == 0) {
-                attention_consumer(g, s);
-            }
-
-            inst_t inst{s};
-            if (inst.has_moe_work()) {
-                moe_consumer(g, s, warp_id, inst);
+            if (warp_id < FUSED_ATTN_CONSUMER_WARPS) {
+                // warp 0 做 attention，warp 1~7 暂时空闲（可扩展）
+                if (warp_id == 0) {
+                    attention_consumer(g, s);
+                }
+            } else {
+                inst_t inst{s};
+                if (inst.has_moe_work()) {
+                    moe_consumer(g, s, warp_id - FUSED_ATTN_CONSUMER_WARPS, inst);
+                }
             }
         }
 
@@ -649,11 +656,10 @@ struct fused_attn_moe_op {
                                              megakernel::state<Config> &s,
                                              int local_moe_warp_id,
                                              inst_t &inst) {
-            // 等待目标 token 的 attention 完成
-            // 【注意】warp 0 自己完成 attention 后才进入此函数，所以 warp 0 不需要等
-            // 但 warp 1~15 需要等 warp 0 的 attention 结果可见
-            // 使用 attn_done_barrier 作为 cross-warp 同步点
-            if (local_moe_warp_id != 0 && kittens::laneid() == 0) {
+            // 等待目标 token 的 attention 完成（由 attn_done_barrier 标记）
+            // 只让 local warp 0（即 global warp 8）中的 lane 0 做 spin wait，
+            // 然后通过 moe_act_arrived semaphore 通知其他 7 个 MoE warp
+            if (local_moe_warp_id == 0 && kittens::laneid() == 0) {
                 while (g.attn_done_barrier.raw_ptr != nullptr &&
                        *(volatile int *)&g.attn_done_barrier.raw_ptr[inst.moe_token_idx] < 1) {
                     __nanosleep(Config::GMEM_SPIN_LOOP_SLEEP_NANOS);
@@ -664,47 +670,52 @@ struct fused_attn_moe_op {
             // 等待 loader 信号
             kittens::wait(sems_t::moe_act_arrived(s), 0);
 
-            // 每个 warp 加载自己负责的 activation 片段（直接到寄存器）
-            // 【关键】不使用 smem 中转（page 10 会被 loader 的 lane>=10 分支提前 finish_page 释放）
-            // 直接从 raw_ptr 读 bf16 → 逐元素转 float，填充 rv_fl 寄存器
-            // rv_fl<N> 布局：lane i 持有元素 i, i+32, i+64, ..., i+(N-32)
-            //   即 data[k] = src[lane + k*32]，k=0..N/32-1
-            constexpr int RED_DIM = MOE_REDUCTION_DIM_PER_WARP;
-            using moe_rv_t = kittens::rv_fl<RED_DIM>;
+            // 每个 warp 加载自己负责的 activation 片段（RED_DIM=256 个元素）
+            // 直接从 raw_ptr 读 bf16 → float，填充 rv_fl<256> 寄存器
+            // rv_fl<N> naive layout: lane i 持有 src[i], src[i+32], ..., src[i+(N-32)]
+            // 即 data[k][0] = src[k*32 + lane], k=0..N/32-1
+            constexpr int RED_DIM   = MOE_REDUCTION_DIM_PER_WARP;  // 256
+            constexpr int HALF_DIM  = RED_DIM / 2;                  // 128
+            using moe_rv_t      = kittens::rv_fl<RED_DIM>;
+            using moe_rv_half_t = kittens::rv_fl<HALF_DIM>;
             moe_rv_t activations_vec;
 
             {
                 const kittens::bf16 *src;
                 if (inst.moe_weight_type == 2) {
-                    // down_proj: 从 moe_intermediate 读 hidden_dim 片段
-                    // moe_intermediate shape: [1,1,1, intermediate_dim]，逻辑上是
-                    // intermediate_dim 个 bf16 元素的一维数组
-                    // reduction_block * hidden_dim 定位到当前 reduction block 的起点
                     src = g.moe_intermediate.raw_ptr +
                           inst.moe_reduction_block * Globals::hidden_dim +
                           local_moe_warp_id * RED_DIM;
                 } else {
-                    // up/gate: 从 moe_input_activations 读 token 的 hidden_dim 片段
                     src = g.moe_input_activations.raw_ptr +
                           inst.moe_token_idx * Globals::hidden_dim +
                           local_moe_warp_id * RED_DIM;
                 }
-
-                // 每个 lane 加载 RED_DIM/32 = 8 个元素，直接转 float 存入寄存器
-                // rv_fl<N> naive layout: lane i 持有 src[i], src[i+32], ..., src[i+(N-32)]
-                // 即 data[w][0] = src[w*32 + lane], w=0..N/32-1
                 int lane = kittens::warp::laneid();
                 #pragma unroll
                 for (int k = 0; k < RED_DIM / 32; k++) {
                     activations_vec.data[k][0] = __bfloat162float(src[lane + k * 32]);
                 }
-                // 无需 sync：每个 warp 完全独立加载自己的寄存器片段
             }
+
+            // rv_fl<256> 的前/后半各 128 个元素对应两个子块
+            // data[0..3] → 前 128 元素 (HALF_DIM/32=4 个 outer_dim)
+            // data[4..7] → 后 128 元素
+            // 注意：rv_fl<256> outer_dim = (16+1)/2 = 8，两个半各占 4 个 slot
+            // ★ 使用 reinterpret 取子向量视图（内存连续，布局相同）
+            moe_rv_half_t &act_lo = *reinterpret_cast<moe_rv_half_t *>(&activations_vec.data[0][0]);
+            moe_rv_half_t &act_hi = *reinterpret_cast<moe_rv_half_t *>(&activations_vec.data[HALF_DIM / 32][0]);
 
             // MoE matvec 流水线
             int num_iters = inst.moe_iters();
-            constexpr int WARPS_PER_PAGE = FUSED_MOE_CONSUMER_WARPS / MOE_STAGE_PAGES;
-            int page_index = local_moe_warp_id / WARPS_PER_PAGE;
+            // 每个 stage 有 MOE_STAGE_PAGES=4 个 page，每 page = st_bf<16,512>
+            // WARPS_PER_PAGE = 8/4 = 2：每个 warp 用某个 page 的 1/2（256 列）
+            // 进一步拆：每个 warp 内循环两次，每次用 128 列的子块
+            //   sub=0: page[page_index] 的前 128 列 → st_bf<16,128> 子块 #(warp%2 * 2 + 0)
+            //   sub=1: page[page_index] 的后 128 列 → st_bf<16,128> 子块 #(warp%2 * 2 + 1)
+            constexpr int WARPS_PER_PAGE = FUSED_MOE_CONSUMER_WARPS / MOE_STAGE_PAGES;  // 2
+            int page_index = local_moe_warp_id / WARPS_PER_PAGE;  // 0..3
+            int sub_offset = local_moe_warp_id % WARPS_PER_PAGE;  // 0 或 1，决定使用哪 128 列
 
             int input_stage = 0, output_stage = 0;
 
@@ -714,16 +725,45 @@ struct fused_attn_moe_op {
                 kittens::wait(sems_t::moe_out_finished(s, output_stage),
                               (i % (2 * MOE_PIPELINE_STAGES)) < MOE_PIPELINE_STAGES);
 
+                // 每个 page = st_bf<16, 512>，分为 4 个 st_bf<16, 128> 子块
+                // warp 的 sub_offset 决定用哪个子块
+                // sub_offset=0 → 子块 0,1（前 256 列）的前半 128
+                // sub_offset=1 → 子块 0,1（前 256 列）的后半 128
+                // 实际上：warp 负责的 256 列 = [sub_offset*256 .. sub_offset*256+255]
+                // 子块 a = [sub_offset*256 .. sub_offset*256+127] (st_bf<16,128>)
+                // 子块 b = [sub_offset*256+128 .. sub_offset*256+255] (st_bf<16,128>)
                 int weight_page = s.pid(PAGE_MOE_W_START + input_stage * MOE_STAGE_PAGES + page_index);
-                kittens::st_bf<16, RED_DIM> &weights =
-                    reinterpret_cast<kittens::st_bf<16, RED_DIM> *>(
-                        s.pages[weight_page].ptr())[local_moe_warp_id % WARPS_PER_PAGE];
+                // 每个 page = st_bf<16,512>，内部有 4 个 st_bf<16,128>
+                // sub_offset=0 → 子块 0 和 1；sub_offset=1 → 子块 2 和 3
+                kittens::st_bf<16, HALF_DIM> *weight_sub_base =
+                    reinterpret_cast<kittens::st_bf<16, HALF_DIM> *>(s.pages[weight_page].ptr());
+                kittens::st_bf<16, HALF_DIM> &w_lo = weight_sub_base[sub_offset * 2 + 0];
+                kittens::st_bf<16, HALF_DIM> &w_hi = weight_sub_base[sub_offset * 2 + 1];
 
                 uint8_t *output_scratch = (uint8_t *)s.scratch() +
                     (output_stage * FUSED_MOE_CONSUMER_WARPS + local_moe_warp_id) * MOE_SCRATCH_PER_WARP;
                 kittens::sv_fl<16> &out_smem = *reinterpret_cast<kittens::sv_fl<16> *>(output_scratch);
 
-                matvec(out_smem, weights, activations_vec);
+                // 分两个 128-col 子块做 matvec，寄存器累加，最后写 out_smem
+                // 这样 matvec 内部只需 rt_fl<16,128>（64 floats/lane），消除寄存器溢出
+                // 两次都复用 out_smem 作临时输出（write→load→add）
+                kittens::rv_fl<16> out_accum;
+                kittens::warp::zero(out_accum);
+
+                // 子块 lo（前 128 列）→ 写入 out_smem → load 到 out_accum
+                matvec(out_smem, w_lo, act_lo);
+                kittens::warp::load(out_accum, out_smem);
+
+                // 子块 hi（后 128 列）→ 写入 out_smem → load 到 tmp → 累加
+                matvec(out_smem, w_hi, act_hi);
+                {
+                    kittens::rv_fl<16> tmp_hi;
+                    kittens::warp::load(tmp_hi, out_smem);
+                    kittens::warp::add(out_accum, out_accum, tmp_hi);
+                }
+
+                // 最终结果写入 out_smem 供 storer 读取
+                kittens::warp::store(out_smem, out_accum);
 
                 kittens::warp::sync();
                 kittens::warp::arrive(sems_t::moe_out_arrived(s, output_stage));
