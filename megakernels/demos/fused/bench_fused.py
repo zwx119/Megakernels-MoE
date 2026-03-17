@@ -554,6 +554,12 @@ def run_fused_kernel(mk_func, tensors, instructions_tensor, timings_tensor,
     调用编译好的 fused CUDA kernel。
     参数顺序必须与 main.cu 中的 pybind11 binding 完全一致。
     """
+    # 【关键】预填充 barriers：
+    # attention consumer 会 spin-wait 在 Bar[layer_idx, 0, head_idx] >= 4，
+    # 这是等待前序 RMS+QKV matmul kernel 完成的信号。
+    # 在独立 benchmark 中没有前序 kernel，必须预填充。
+    tensors['barriers'][:, 0, :config.num_attention_heads] = 4
+
     mk_func(
         # VM 基础设施
         tensors['barriers'],

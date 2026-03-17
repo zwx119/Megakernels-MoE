@@ -331,6 +331,13 @@ def tensorize(instructions, sm_count, device):
 
 def call_kernel(mk_func, t, inst_t, timing_t, seq_len, batch_size):
     """调用 CUDA kernel，参数顺序与 main.cu pybind11 一致。"""
+    # 【关键】预填充 barriers：
+    # attention consumer 会 spin-wait 在 Bar[layer_idx, 0, head_idx] >= 4，
+    # 这是等待 RMS+QKV matmul（前序 kernel）完成的信号。
+    # 在独立 benchmark 中没有前序 kernel，所以必须预填充为 >= 4。
+    # Bar 的 shape = [NUM_LAYERS, 12, total_heads]，opcode 维度 idx=0 是 QKV 结果就绪的信号。
+    t['barriers'][:, 0, :NUM_ATTENTION_HEADS] = 4  # Q heads 全部标记为就绪
+
     mk_func(
         t['barriers'], inst_t, timing_t,
         t['qkv_weights'], t['attn_norm_weights'], t['o_weights'], t['mlp_norm_weights'],
