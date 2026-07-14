@@ -1,4 +1,5 @@
 local/
+.worktrees/
 __pycache__/
 *.egg-info/
 
